@@ -1,10 +1,10 @@
 from ..config import Settings
 from .base import BaseLLMAdapter, LLMAdapter, PlanGenerationError
-from .providers import AnthropicAdapter, OpenAICompatAdapter
+from .providers import AnthropicAdapter, OpenAICompatAdapter, CodexCLIAdapter
 
 
 def build_adapter(s: Settings) -> BaseLLMAdapter:
-    if s.llm_provider == "anthropic":
+    if s.llm_provider == "codex":\n        return CodexCLIAdapter(s.llm_model)\n    if s.llm_provider == "anthropic":
         return AnthropicAdapter(s.llm_api_key, s.llm_model)
     if s.llm_provider == "openai":
         return OpenAICompatAdapter(
@@ -16,4 +16,4 @@ def build_adapter(s: Settings) -> BaseLLMAdapter:
 
 
 __all__ = ["BaseLLMAdapter", "LLMAdapter", "PlanGenerationError", "build_adapter",
-           "AnthropicAdapter", "OpenAICompatAdapter"]
+           "AnthropicAdapter", "OpenAICompatAdapter", "CodexCLIAdapter"]
