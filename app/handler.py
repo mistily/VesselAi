@@ -3,8 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Coroutine, Literal
+
+from agents.base import AgentContext, BaseAgent
+from agents.registry import role_request
 
 from .executor import Executor
 from .messenger import Messenger
@@ -19,20 +22,26 @@ log = logging.getLogger(__name__)
 HELP_TEXT = (
     "Hi! I turn project ideas into structured plans. Mention me (or use `/plan`) with something "
     "like _plan the Q3 checkout migration_. I'll draft a plan, and an approver must sign off "
-    "before anything is executed."
+    "before anything is executed. For focused help, use `/ask developer <question>` or prefix "
+    "a message with `developer:`, `requirements:`, `knowledge:`, `qa:`, or `operations:`."
 )
-OUT_OF_SCOPE_TEXT = "That's outside what I can help with. I only do project planning."
+OUT_OF_SCOPE_TEXT = "That's outside what I can help with. I only do project planning or explicit agent requests."
 PLAN_FAILED_TEXT = "⚠️ I couldn't produce a valid plan for that. Nothing was executed — try rephrasing."
+AGENT_FAILED_TEXT = "⚠️ I couldn't complete that agent request. Nothing was changed — please try again."
+AGENT_REQUEST_HELP = (
+    "Choose an agent and include a request, for example `/ask developer explain this implementation` "
+    "or `/ask requirements: define acceptance criteria`."
+)
 
 
 @dataclass(frozen=True)
 class IncomingEvent:
-    event_id: str  # Slack event_id (idempotency key); "cmd:<trigger_id>" for slash commands
+    event_id: str
     channel_id: str
     user_id: str
     text: str
-    thread_ts: str | None  # None only for slash commands (we open a thread ourselves)
-    source: Literal["mention", "dm", "command"]
+    thread_ts: str | None
+    source: Literal["mention", "dm", "command", "ask"]
 
 
 @dataclass
@@ -40,13 +49,13 @@ class Deps:
     repo: PlanRepository
     messenger: Messenger
     router: VesselRouter
-    agents: dict[str, PMAgent]  # intent -> agent (single PM agent for now)
+    agents: dict[str, PMAgent]
     executor: Executor
     approver_ids: frozenset[str]
     require_separate_approver: bool = False
+    role_agents: dict[str, BaseAgent] = field(default_factory=dict)
 
 
-# --- background task helper ---------------------------------------------------
 _tasks: set[asyncio.Task] = set()
 
 
@@ -64,11 +73,8 @@ def spawn(coro: Coroutine) -> asyncio.Task:
     return task
 
 
-# --- stage 1: event -> plan card ------------------------------------------------
 async def handle_event(ev: IncomingEvent, d: Deps) -> None:
     text = clean_text(ev.text)
-
-    # Idempotency gate: the DB's unique index decides, before any other side effect.
     plan_id = d.repo.claim_event(ev.event_id, ev.channel_id, ev.thread_ts, ev.user_id, text)
     if plan_id is None:
         log.info("duplicate event %s ignored", ev.event_id)
@@ -79,21 +85,40 @@ async def handle_event(ev: IncomingEvent, d: Deps) -> None:
     )
 
     placeholder_ts: str | None = None
+    thread_ts = ev.thread_ts
     try:
-        thread_ts = ev.thread_ts
-        if thread_ts is None:  # slash command: open a thread under a root message
+        if thread_ts is None:
             thread_ts = await d.messenger.post(
                 ev.channel_id, f"<@{ev.user_id}> requested a plan: {clip(text, 300)}"
             )
             d.repo.set_thread(plan_id, thread_ts)
 
+        agent_request = role_request(text, d.role_agents)
+        if ev.source == "ask" and agent_request is None:
+            d.repo.transition(plan_id, "pending", "ignored")
+            await d.messenger.post(ev.channel_id, AGENT_REQUEST_HELP, thread_ts=thread_ts)
+            return
+        if agent_request is not None:
+            agent, request = agent_request
+            d.repo.set_intent(plan_id, f"agent:{agent.name}")
+            placeholder_ts = await d.messenger.post(
+                ev.channel_id, f"⏳ {agent.name} is working…", thread_ts=thread_ts
+            )
+            result = await agent.arun(
+                request,
+                AgentContext(channel=ev.channel_id, requester=ev.user_id),
+            )
+            d.repo.transition(plan_id, "pending", "ignored")
+            response = f"*{result.agent}*\n{result.response}"
+            await d.messenger.update(ev.channel_id, placeholder_ts, clip(response, 3500))
+            return
+
         decision = await d.router.route(text, ev.source)
         d.repo.set_intent(plan_id, decision.intent)
         d.repo.audit(plan_id, "event_received", "system",
                      f"routed intent={decision.intent} via={decision.via}: {decision.reason}")
-
         agent = d.agents.get(decision.intent)
-        if agent is None:  # chit-chat / out-of-scope: reply and stop, no plan
+        if agent is None:
             d.repo.transition(plan_id, "pending", "ignored")
             reply = HELP_TEXT if decision.intent == "chit_chat" else OUT_OF_SCOPE_TEXT
             await d.messenger.post(ev.channel_id, reply, thread_ts=thread_ts)
@@ -103,30 +128,30 @@ async def handle_event(ev: IncomingEvent, d: Deps) -> None:
             ev.channel_id, "⏳ Drafting a plan…", thread_ts=thread_ts
         )
         plan = await agent.plan(raw_input=text, requester=ev.user_id, intent=decision.intent)
-
         plan_json = plan.model_dump_json()
         d.repo.save_plan(plan_id, plan_json)
         d.repo.audit(plan_id, "plan_generated", "system",
                      f"agent={agent.name} work_items={len(plan.work_items)}", plan_json)
-
         card_text, blocks = plan_card(plan_id, plan, ev.user_id)
         await d.messenger.update(ev.channel_id, placeholder_ts, card_text, blocks)
-    except Exception as exc:  # fail closed
+    except Exception as exc:
         log.exception("handle_event failed for %s", ev.event_id)
         d.repo.transition(plan_id, "pending", "failed")
-        d.repo.audit(plan_id, "failed", "system", f"planning failed: {type(exc).__name__}", str(exc))
+        d.repo.audit(plan_id, "failed", "system", f"planning/agent request failed: {type(exc).__name__}", str(exc))
         try:
             if placeholder_ts:
-                await d.messenger.update(ev.channel_id, placeholder_ts, PLAN_FAILED_TEXT)
+                await d.messenger.update(
+                    ev.channel_id, placeholder_ts,
+                    AGENT_FAILED_TEXT if ev.source == "ask" or role_request(text, d.role_agents) else PLAN_FAILED_TEXT,
+                )
             else:
-                await d.messenger.post(ev.channel_id, PLAN_FAILED_TEXT, thread_ts=ev.thread_ts)
+                await d.messenger.post(ev.channel_id, PLAN_FAILED_TEXT, thread_ts=thread_ts)
         except Exception:
             log.exception("could not notify channel of failure")
 
 
-# --- stage 2: approval decision -> execution -------------------------------------
 def _authorized(user_id: str, plan_row: dict, d: Deps) -> bool:
-    if user_id not in d.approver_ids:  # empty allow-list denies everyone
+    if user_id not in d.approver_ids:
         return False
     if d.require_separate_approver and user_id == plan_row["requester"]:
         return False
@@ -146,7 +171,6 @@ async def handle_decision(
         await d.messenger.ephemeral(channel_id, user_id, "I don't recognise that plan.")
         return
     thread_ts = row["thread_ts"]
-
     if not _authorized(user_id, row, d):
         d.repo.audit(plan_id, "approval_received", user_id, f"DENIED {decision}: not authorized",
                      {"user": user_id, "decision": decision})
@@ -157,7 +181,7 @@ async def handle_decision(
         return
 
     new_state = "approved" if decision == "approve" else "rejected"
-    if not d.repo.decide(plan_id, new_state, user_id):  # first decision wins
+    if not d.repo.decide(plan_id, new_state, user_id):
         cur = d.repo.get(plan_id) or {}
         by = f" by <@{cur['decided_by']}>" if cur.get("decided_by") else ""
         await d.messenger.ephemeral(
@@ -167,10 +191,9 @@ async def handle_decision(
         return
     d.repo.audit(plan_id, "approval_received", user_id, new_state,
                  {"user": user_id, "decision": decision})
-
     plan = Plan.model_validate_json(row["plan_json"])
     verdict = f"✅ Approved by <@{user_id}>" if decision == "approve" else f"❌ Rejected by <@{user_id}>"
-    try:  # retire the buttons; a cosmetic failure must not undo a durable decision
+    try:
         card_text, blocks = plan_card(plan_id, plan, row["requester"], outcome=verdict)
         await d.messenger.update(channel_id, message_ts, card_text, blocks)
     except Exception:

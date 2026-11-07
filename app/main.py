@@ -14,6 +14,7 @@ from .pm_agent import PMAgent
 from .repository import PlanRepository
 from .router import VesselRouter
 from .slack_app import register_handlers
+from agents.registry import register_agents
 
 log = logging.getLogger("switch_planner")
 
@@ -34,6 +35,7 @@ async def main() -> None:
         messenger=SlackMessenger(app.client),
         router=VesselRouter(classifier=adapter),
         agents={"project_plan": PMAgent(adapter)},
+        role_agents=register_agents(lambda: adapter),
         executor=SummaryExecutor(),
         approver_ids=settings.approver_ids,
         require_separate_approver=settings.require_separate_approver,
