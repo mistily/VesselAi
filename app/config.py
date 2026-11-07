@@ -6,7 +6,7 @@ from typing import Mapping
 
 from dotenv import load_dotenv
 
-PROVIDERS = ("anthropic", "openai", "local")
+PROVIDERS = ("codex", "anthropic", "openai", "local")
 
 
 class ConfigError(RuntimeError):
@@ -31,11 +31,11 @@ class Settings:
             load_dotenv()
             env = os.environ
 
-        provider = env.get("LLM_PROVIDER", "anthropic").strip().lower()
+        provider = env.get("LLM_PROVIDER", "codex").strip().lower()
         if provider not in PROVIDERS:
             raise ConfigError(f"LLM_PROVIDER must be one of {PROVIDERS}, got {provider!r}")
 
-        required = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "LLM_MODEL"]
+        required = ["SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"]
         if provider != "local":
             required.append("LLM_API_KEY")
         missing = [k for k in required if not env.get(k, "").strip()]
@@ -54,7 +54,7 @@ class Settings:
             slack_app_token=env["SLACK_APP_TOKEN"].strip(),
             llm_provider=provider,
             llm_api_key=env.get("LLM_API_KEY", "").strip(),
-            llm_model=env["LLM_MODEL"].strip(),
+            llm_model=env.get("LLM_MODEL", "").strip(),
             llm_base_url=base_url,
             approver_ids=approvers,
             require_separate_approver=env.get("REQUIRE_SEPARATE_APPROVER", "false").strip().lower()
